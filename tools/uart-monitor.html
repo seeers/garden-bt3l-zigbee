@@ -1,0 +1,213 @@
+<!doctype html>
+<html lang="de">
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>UART-Mitschnitt · ALDI GARDEN</title>
+<style>
+:root{color-scheme:dark;font:16px system-ui;background:#10191e;color:#edf4f2}
+*{box-sizing:border-box}body{margin:0}main{max-width:1060px;margin:auto;padding:34px 20px}
+h1{margin:0 0 8px;font-size:clamp(1.7rem,4vw,2.6rem)}h2{font-size:1.12rem;margin:0 0 12px}
+p{line-height:1.5}.intro,small{color:#b7c8ce}.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(260px,1fr));gap:14px}
+section{background:#17262d;border:1px solid #31444c;border-radius:12px;padding:18px;margin:14px 0}
+.grid section{margin:0}.row{display:flex;gap:8px;align-items:center;flex-wrap:wrap}
+button,input{font:inherit;border:1px solid #52717a;border-radius:7px;padding:8px 12px;background:#20343c;color:inherit}
+button{cursor:pointer}button.primary{background:#a1e6c8;border-color:#a1e6c8;color:#102a21;font-weight:650}button:disabled{opacity:.45;cursor:default}
+input[type=number]{width:105px}input[type=text]{flex:1;min-width:180px}
+.status{min-height:2.8em}.log{overflow:auto;max-height:420px;border:1px solid #31444c;border-radius:8px;margin-top:12px}
+table{border-collapse:collapse;width:100%;font:14px ui-monospace,monospace;text-align:left}th,td{padding:7px 10px;border-bottom:1px solid #31444c;vertical-align:top}th{position:sticky;top:0;background:#20343c}td:last-child{overflow-wrap:anywhere}td:nth-child(2){min-width:9em}.ch0{color:#ade9d0}.ch1{color:#a7cfff}.mark{color:#ffda90}code{color:#ade9d0}
+</style>
+<main>
+<header><h1>UART-Mitschnitt</h1><p class="intro">ALDI GARDEN · Beide UART-Richtungen passiv erfassen und im selben Zeitverlauf auswerten.</p></header>
+<section aria-labelledby="setup"><h2 id="setup">Messaufbau</h2>
+<p>Zwei USB-UART-Adapter mit <strong>3,3-V-Logik</strong> verwenden. Beide GND-Leitungen an BT3L-Pin 9, Adapter-RX jeweils wie unten angegeben anschließen. Adapter-TX und VCC frei lassen. Das Gerät über seine normale Versorgung betreiben.</p>
+<div class="row"><label for="baud">Baudrate</label><input id="baud" type="number" min="1" max="4000000" value="9600"><small>8N1 · Bei unplausiblen Daten auch 115200 testen.</small></div>
+<p id="support" role="status" hidden></p>
+</section>
+<div class="grid">
+<section><h2 class="ch0">BT3L → FT61E0A5</h2><small>Adapter-RX an BT3L-Pin 16 (TX)</small><p class="status" id="status0" role="status">Getrennt</p><div class="row"><button class="primary" id="open0">Port verbinden</button><button id="close0" disabled>Trennen</button></div></section>
+<section><h2 class="ch1">FT61E0A5 → BT3L</h2><small>Adapter-RX an BT3L-Pin 15 (RX)</small><p class="status" id="status1" role="status">Getrennt</p><div class="row"><button class="primary" id="open1">Port verbinden</button><button id="close1" disabled>Trennen</button></div></section>
+</div>
+<section><h2>Testaktionen markieren</h2>
+<p>Marker unmittelbar vor der Aktion setzen. Die Tasten hier schreiben nur ins Log. Für Start und Stopp das Ventil separat bedienen.</p>
+<div class="row" id="markers">
+<button data-marker="Gerät eingeschaltet">Einschalten</button>
+<button data-marker='Start 1 min · App-DPs {"1":true,"11":60}'>Start 1 min</button>
+<button data-marker='Manueller Stopp · App-DP {"1":false}'>Manueller Stopp</button>
+<button data-marker="Automatisches Schließen beobachtet">Auto-Stopp</button>
+</div>
+<form class="row" id="note" style="margin-top:8px"><input id="label" type="text" maxlength="200" required aria-label="Eigener Marker" placeholder="Eigener Marker"><button>Markieren</button></form>
+</section>
+<section><h2>Mitschnitt</h2><div class="row"><button class="primary" id="export" disabled>CSV speichern</button><button id="reset" disabled>Log leeren</button><label><input id="follow" type="checkbox" checked> Automatisch scrollen</label></div>
+<p><small id="count">0 Einträge</small><small> · Zeitstempel beim Empfang im Browser. Ein Datenblock kann mehrere UART-Frames oder nur einen Teil davon enthalten.</small></p>
+<div class="log" id="log" tabindex="0"><table><thead><tr><th scope="col">Zeit (ms)</th><th scope="col">Kanal</th><th scope="col">Hex / Ereignis</th></tr></thead><tbody id="entries"></tbody></table></div>
+</section>
+</main>
+<script>
+'use strict';
+const byId = id => document.getElementById(id);
+const names = ['BT3L → FT61E0A5', 'FT61E0A5 → BT3L'];
+const channels = names.map(() => ({port: null, reader: null, task: null, busy: false, stopping: false}));
+const supported = isSecureContext && 'serial' in navigator;
+const entries = [];
+let epoch = performance.now();
+let renderPending = false;
+let shown = 0;
+function record(channel, value) {
+  entries.push({time: (performance.now() - epoch).toFixed(1), channel, value});
+  if (!renderPending) {
+    renderPending = true;
+    requestAnimationFrame(render);
+  }
+}
+function render() {
+  renderPending = false;
+  const fragment = document.createDocumentFragment();
+  const start = Math.max(shown, entries.length - 400);
+  for (const entry of entries.slice(start)) {
+    const row = document.createElement('tr');
+    row.className = entry.channel === null ? 'mark' : 'ch' + entry.channel;
+    for (const value of [entry.time, entry.channel === null ? 'Marker' : names[entry.channel], entry.value]) {
+      row.insertCell().textContent = value;
+    }
+    fragment.append(row);
+  }
+  const body = byId('entries');
+  body.append(fragment);
+  while (body.rows.length > 400) body.deleteRow(0);
+  shown = entries.length;
+  byId('count').textContent = entries.length + ' Einträge' + (entries.length > 400 ? ' · Letzte 400 sichtbar, CSV enthält alle' : '');
+  byId('export').disabled = byId('reset').disabled = !entries.length;
+  if (byId('follow').checked) byId('log').scrollTop = byId('log').scrollHeight;
+}
+function controls(index, message) {
+  const channel = channels[index];
+  byId('open' + index).disabled = !supported || channel.busy || Boolean(channel.port);
+  byId('close' + index).disabled = channel.busy || !channel.port;
+  byId('status' + index).textContent = message;
+  byId('baud').disabled = channels.some(item => item.busy || item.port);
+}
+async function openPort(index) {
+  const baudInput = byId('baud');
+  if (!baudInput.reportValidity() || !baudInput.value) return;
+  const baudRate = Number(baudInput.value);
+  const channel = channels[index];
+  channel.busy = true;
+  controls(index, 'Port auswählen …');
+  let message;
+  try {
+    const port = await navigator.serial.requestPort();
+    if (channels.some(item => item.port === port)) throw new Error('Dieser Port ist bereits verbunden.');
+    await port.open({baudRate, dataBits: 8, stopBits: 1, parity: 'none', flowControl: 'none'});
+    channel.port = port;
+    channel.stopping = false;
+    record(null, names[index] + ' verbunden · ' + baudRate + ' Baud · 8N1');
+    message = 'Empfang aktiv · ' + baudRate + ' Baud';
+  } catch (error) {
+    message = error.name === 'NotFoundError' ? 'Portauswahl abgebrochen' : error.message;
+  } finally {
+    channel.busy = false;
+    controls(index, message);
+  }
+  if (channel.port) channel.task = readPort(index);
+}
+async function readPort(index) {
+  const channel = channels[index];
+  const port = channel.port;
+  let message = 'Getrennt';
+  try {
+    while (!channel.stopping && port.readable) {
+      const stream = port.readable;
+      const reader = stream.getReader();
+      channel.reader = reader;
+      try {
+        while (!channel.stopping) {
+          const {value, done} = await reader.read();
+          if (done) return;
+          if (value.length) record(index, Array.from(value, byte => byte.toString(16).padStart(2, '0').toUpperCase()).join(' '));
+        }
+      } catch (error) {
+        if (channel.stopping) return;
+        message = 'Lesefehler · ' + error.message;
+        if (!port.readable || port.readable === stream) return;
+        record(null, names[index] + ' · ' + message + ' · Empfang wird fortgesetzt');
+        message = 'Getrennt';
+      } finally {
+        reader.releaseLock();
+        channel.reader = null;
+      }
+    }
+  } catch (error) {
+    message = 'Lesefehler · ' + error.message;
+  } finally {
+    channel.busy = true;
+    controls(index, 'Port wird geschlossen …');
+    try {
+      await port.close();
+    } catch (error) {
+      if (port.readable) message = 'Schließen fehlgeschlagen · ' + error.message;
+    }
+    channel.port = null;
+    channel.task = null;
+    channel.busy = false;
+    record(null, names[index] + ' · ' + message);
+    controls(index, message);
+  }
+}
+async function closePort(index) {
+  const channel = channels[index];
+  channel.stopping = true;
+  channel.busy = true;
+  controls(index, 'Trennen …');
+  try {
+    await channel.reader?.cancel();
+  } catch {
+    // The read loop handles disconnects and releases the port.
+  }
+  await channel.task;
+}
+for (const index of channels.keys()) {
+  byId('open' + index).onclick = () => openPort(index);
+  byId('close' + index).onclick = () => closePort(index);
+  controls(index, 'Getrennt');
+}
+if (!supported) {
+  const warning = byId('support');
+  warning.hidden = false;
+  warning.textContent = 'Web Serial fehlt in dieser Ansicht. Die Datei oben in Chrome oder Edge am PC öffnen. Falls die lokale Datei blockiert wird, über localhost oder HTTPS aufrufen.';
+}
+byId('markers').onclick = event => {
+  const button = event.target.closest('button[data-marker]');
+  if (button) record(null, button.dataset.marker);
+};
+byId('note').onsubmit = event => {
+  event.preventDefault();
+  const input = byId('label');
+  if (input.value.trim()) record(null, input.value.trim());
+  input.value = '';
+};
+byId('reset').onclick = () => {
+  if (!confirm('Mitschnitt leeren? Ungespeicherte Einträge gehen verloren.')) return;
+  entries.length = 0;
+  shown = 0;
+  byId('entries').replaceChildren();
+  epoch = performance.now();
+  render();
+};
+byId('export').onclick = () => {
+  const quote = value => {
+    const text = String(value);
+    const safe = /^[\s]*[=+@-]/.test(text) ? "'" + text : text;
+    return '"' + safe.replaceAll('"', '""') + '"';
+  };
+  const csv = ['Zeit_ms;Kanal;Typ;Daten', ...entries.map(({time, channel, value}) =>
+    [time, channel === null ? 'Marker' : names[channel], channel === null ? 'Ereignis' : 'UART', value].map(quote).join(';')
+  )].join('\r\n');
+  const url = URL.createObjectURL(new Blob(['\uFEFF', csv], {type: 'text/csv;charset=utf-8'}));
+  const link = document.createElement('a');
+  link.href = url;
+  link.download = 'uart-mitschnitt-' + new Date().toISOString().replaceAll(':', '-') + '.csv';
+  link.click();
+  setTimeout(() => URL.revokeObjectURL(url), 1000);
+};
+</script>
+</html>

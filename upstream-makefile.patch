@@ -1,0 +1,22 @@
+diff --git a/makefile b/makefile
+index 959967f..6de3eef 100644
+--- a/makefile
++++ b/makefile
+@@ -123,7 +123,7 @@ GCC_FLAGS += $(TEL_CHIP)
+ LS_INCLUDE := -L$(SDK_PATH)/platform/lib -L$(SDK_PATH)/stack/zigbee/lib/tc32 -L$(SDK_PATH)/stack/ble/lib -L$(OUT_PATH)
+ 
+ #include Project makefile
+--include $(MAKE_PATH)/src.mk
++-include $(if $(APP_MAKEFILE),$(APP_MAKEFILE),$(MAKE_PATH)/src.mk)
+ #include SDK makefile
+ -include $(MAKE_PATH)/platform.mk
+ -include $(MAKE_PATH)/proj.mk
+@@ -168,7 +168,7 @@ GCC_FLAGS += $(TEL_CHIP)
+ LS_INCLUDE := -L$(SDK_PATH)/platform/lib -L$(SDK_PATH)/zigbee/lib/tc32 -L$(SDK_PATH)/proj -L$(SDK_PATH)/platform -L$(OUT_PATH)
+ 
+ #include Project makefile
+--include $(MAKE_PATH)/src.mk
++-include $(if $(APP_MAKEFILE),$(APP_MAKEFILE),$(MAKE_PATH)/src.mk)
+ #include SDK makefile
+ -include $(MAKE_PATH)/platform.mk
+ -include $(MAKE_PATH)/proj.mk

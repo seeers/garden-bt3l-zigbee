@@ -1,0 +1,661 @@
+<!doctype html>
+<html lang="de">
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>ALDI GARDEN · BLE-Steuerung</title>
+<style>
+:root{color-scheme:dark;font:16px system-ui;background:#10201c;color:#edf7f0}
+*{box-sizing:border-box}body{margin:0}main{max-width:780px;margin:auto;padding:34px 20px}
+h1{font-size:clamp(1.7rem,5vw,2.7rem);margin:0}h2{font-size:1.1rem;margin:0 0 12px}
+p{line-height:1.5}section{margin:16px 0;padding:18px;background:#192d25;border:1px solid #3c584b;border-radius:12px}
+label{display:grid;gap:5px}input,button{font:inherit;border:1px solid #59796b;border-radius:7px;padding:8px 12px;background:#253d33;color:inherit;min-width:0}
+button{cursor:pointer}button:disabled{cursor:default;opacity:.47}.primary{background:#b3eacb;color:#132e20;font-weight:700}
+.row{display:flex;flex-wrap:wrap;align-items:end;gap:9px}.fields{display:grid;grid-template-columns:repeat(auto-fit,minmax(190px,1fr));gap:10px;margin:12px 0}
+small,.muted{color:#c1d6cb}a{color:#b3eacb}pre{white-space:pre-wrap;overflow-wrap:anywhere;max-height:240px;overflow:auto}
+input[type=number]{width:115px}
+</style>
+<main>
+<h1>ALDI GARDEN · BLE-Steuerung</h1>
+<p class="muted">Manuell bewässern und stoppen. Den UART-Mitschnitt kannst du parallel in einem zweiten Tab laufen lassen.</p>
+<section>
+<h2>Fabrikneues Ventil lokal koppeln</h2>
+<p>Das Ventil in den Kopplungsmodus bringen und im Bluetooth-Dialog „TY“ auswählen. Die Seite prüft zuerst das BLE-Profil. Nach erfolgreicher Prüfung kannst du Zugangsdaten erzeugen und die Bindung starten.</p>
+<div class="row"><button class="primary" id="inspect">Neues Ventil prüfen</button><button id="save-setup" disabled>Zugangsdaten speichern</button><button id="provision" disabled>Lokal koppeln</button></div>
+<p id="setup-status" role="status"></p>
+<p class="muted"><small>Die Prüfung benötigt in Chrome die experimentelle Funktion zum Lesen von BLE-Werbedaten. Falls sie fehlt, in <code>chrome://flags/#enable-experimental-web-platform-features</code> aktivieren und Chrome neu starten.</small></p>
+</section><section><h2>Bluetooth-Verbindung</h2>
+<p>Für ein bereits gebundenes Gerät brauchst du dessen Tuya-Geräte-ID, UUID und lokalen Schlüssel, etwa aus einem vorhandenen Tuya-BLE-Export. Die Seite speichert und überträgt die Angaben nicht an einen Server.</p>
+<form id="connect-form" autocomplete="off">
+<div class="fields">
+<label>Geräte-ID <input id="device-id" required maxlength="24" spellcheck="false"></label>
+<label>Geräte-UUID <input id="uuid" required maxlength="32" spellcheck="false"></label>
+<label>Local Key <input id="local-key" type="password" required minlength="6" spellcheck="false"></label>
+<label>SecKey (falls vorhanden) <input id="sec-key" type="password" minlength="16" maxlength="16" spellcheck="false"></label>
+</div>
+<div class="row"><button class="primary" id="connect">Bluetooth-Gerät wählen</button><button type="button" id="disconnect" disabled>Trennen</button></div>
+</form>
+<p id="status" role="status">Getrennt</p>
+</section>
+<section>
+<h2>Ventil</h2>
+<p id="valve">Ventil unbekannt · Batterie unbekannt</p>
+<form id="water-form" class="row">
+<label>Dauer (Sekunden) <input id="duration" type="number" min="1" max="35940" value="60" required></label>
+<button class="primary" id="start" disabled>Start</button>
+<button type="button" id="stop" disabled>Stopp</button>
+<button type="button" id="refresh" disabled>Status abfragen</button>
+</form>
+<p><small>Erster Test ohne angeschlossenen Wasserzulauf.</small></p>
+</section>
+<section><h2>BLE-Ereignisse</h2><pre id="log" aria-live="polite"></pre></section>
+<p class="muted"><small>Protokollreferenz <a href="https://github.com/Wheemer/local-tuya-ble">Local Tuya BLE</a> · <a href="https://github.com/ha-tuya-ble/ha_tuya_ble/pull/151">ALDI-Geräteprofil</a></small></p>
+</main>
+<script>
+'use strict';
+
+const encoder = new TextEncoder();
+const bytes = (...values) => Uint8Array.of(...values);
+function concat(...parts) {
+  const result = new Uint8Array(parts.reduce((size, part) => size + part.length, 0));
+  let offset = 0;
+  for (const part of parts) {
+    result.set(part, offset);
+    offset += part.length;
+  }
+  return result;
+}
+const view = data => new DataView(data.buffer, data.byteOffset, data.byteLength);
+const word = value => bytes(value >>> 8, value);
+const integer = value => bytes(value >>> 24, value >>> 16, value >>> 8, value);
+function ascii(value) {
+  if (!/^[\x20-\x7E]+$/.test(value)) throw new Error('Zugangsdaten müssen aus druckbaren ASCII-Zeichen bestehen.');
+  return encoder.encode(value);
+}
+
+// MD5 is required by the Tuya wire protocol for deriving AES keys.
+const md5Constants = Array.from({length:64}, (_, i) => Math.floor(2 ** 32 * Math.abs(Math.sin(i + 1))));
+const md5Shifts = [[7,12,17,22], [5,9,14,20], [4,11,16,23], [6,10,15,21]];
+function md5(input) {
+  const padded = new Uint8Array(Math.ceil((input.length + 9) / 64) * 64);
+  padded.set(input);
+  padded[input.length] = 0x80;
+  const data = view(padded);
+  data.setUint32(padded.length - 8, input.length * 8, true);
+  const state = [0x67452301, 0xefcdab89, 0x98badcfe, 0x10325476];
+  for (let offset = 0; offset < padded.length; offset += 64) {
+    let [a,b,c,d] = state;
+    for (let i = 0; i < 64; i++) {
+      const round = i >>> 4;
+      const mix = [(b & c) | (~b & d), (d & b) | (~d & c), b ^ c ^ d, c ^ (b | ~d)][round];
+      const index = [i, 5*i+1, 3*i+5, 7*i][round] & 15;
+      const sum = (a + mix + md5Constants[i] + data.getUint32(offset + index * 4, true)) | 0;
+      const shift = md5Shifts[round][i & 3];
+      [a,b,c,d] = [d, (b + ((sum << shift) | (sum >>> (32 - shift)))) | 0, b, c];
+    }
+    [a,b,c,d].forEach((value, index) => {state[index] = (state[index] + value) | 0;});
+  }
+  const result = new Uint8Array(16);
+  state.forEach((value, index) => view(result).setInt32(index * 4, value, true));
+  return result;
+}
+function crc16(data) {
+  let crc = 0xffff;
+  for (const byte of data) {
+    crc ^= byte;
+    for (let bit = 0; bit < 8; bit++) crc = (crc >>> 1) ^ ((crc & 1) ? 0xa001 : 0);
+  }
+  return crc;
+}
+function varint(value) {
+  const result = [];
+  do {
+    const low = value & 127;
+    value >>>= 7;
+    result.push(low | (value ? 128 : 0));
+  } while (value);
+  return Uint8Array.from(result);
+}
+function readVarint(data, position) {
+  let value = 0;
+  for (let shift = 0; shift <= 21 && position < data.length; shift += 7) {
+    const byte = data[position++];
+    value |= (byte & 127) << shift;
+    if (!(byte & 128)) return [value, position];
+  }
+  throw new Error('Ungültiger BLE-Fragmentkopf.');
+}
+const importKey = raw => crypto.subtle.importKey('raw', raw, 'AES-CBC', false, ['encrypt','decrypt']);
+function frameBody(seq, reply, code, payload) {
+  const header = concat(integer(seq), integer(reply), word(code), word(payload.length), payload);
+  const raw = new Uint8Array(Math.ceil((header.length + 2) / 16) * 16);
+  raw.set(header);
+  raw.set(word(crc16(header)), header.length);
+  return raw;
+}
+async function packFrame(key, flag, seq, reply, code, payload) {
+  const raw = frameBody(seq, reply, code, payload);
+  const iv = crypto.getRandomValues(new Uint8Array(16));
+  const encrypted = new Uint8Array(await crypto.subtle.encrypt({name:'AES-CBC', iv}, key, raw));
+  return concat(bytes(flag), iv, encrypted.subarray(0, raw.length));
+}
+async function unpackFrame(key, frame) {
+  if (frame.length < 33 || (frame.length - 17) % 16) throw new Error('Ungültige verschlüsselte Paketlänge.');
+  const iv = frame.subarray(1,17);
+  const ciphertext = frame.subarray(17);
+  const raw = await decryptBlocks(key,iv,ciphertext);
+  return readFrame(raw);
+}
+async function decryptBlocks(key,iv,ciphertext) {
+  // Supply a synthetic PKCS#7 block for Web Crypto to remove.
+  const tail = await crypto.subtle.encrypt({name:'AES-CBC', iv: ciphertext.subarray(-16)}, key, new Uint8Array());
+  return new Uint8Array(await crypto.subtle.decrypt({name:'AES-CBC', iv}, key, concat(ciphertext, new Uint8Array(tail))));
+}
+function readFrame(raw) {
+  const header = view(raw);
+  const end = 12 + header.getUint16(10);
+  if (end + 2 > raw.length || crc16(raw.subarray(0,end)) !== header.getUint16(end)) {
+    throw new Error('Prüfsumme ungültig. Geräteschlüssel oder Protokoll prüfen.');
+  }
+  return {seq:header.getUint32(0), reply:header.getUint32(4), code:header.getUint16(8), payload:raw.subarray(12,end)};
+}
+function fragments(frame, version) {
+  const result = [];
+  for (let offset = 0; offset < frame.length;) {
+    const index = result.length;
+    const header = index ? varint(index) : concat(varint(0), varint(frame.length), bytes(version << 4));
+    const part = frame.subarray(offset, offset + 20 - header.length);
+    result.push(concat(header,part));
+    offset += part.length;
+  }
+  return result;
+}
+
+const normalUuid = short => '0000' + short + '-0000-1000-8000-00805f9b34fb';
+const profile = [
+  ['1910', normalUuid('2b10'), normalUuid('2b11')],
+  ['a201', normalUuid('2b10'), normalUuid('2b11')],
+  ['fd50', '00000002-0000-1001-8001-00805f9b07d0', '00000001-0000-1001-8001-00805f9b07d0']
+];
+class TuyaConnection {
+  constructor(device, credentials, onReport, onError) {
+    Object.assign(this, {device, credentials, onReport, onError});
+    this.version = 2;
+    this.nextSequence = 1;
+    this.pending = new Map();
+    this.writes = Promise.resolve();
+    this.notifications = Promise.resolve();
+    this.listener = event => {
+      const value = event.target.value;
+      const copy = new Uint8Array(value.buffer, value.byteOffset, value.byteLength).slice();
+      this.notifications = this.notifications.then(() => this.receive(copy)).catch(this.onError);
+    };
+  }
+  async connect() {
+    const {local, secure, uuid, id} = this.credentials;
+    this.material = secure ? concat(local, secure) : local.subarray(0,6);
+    this.loginFlag = secure ? 14 : 4;
+    this.login = await importKey(md5(this.material));
+    const server = await this.device.gatt.connect();
+    for (const [serviceId, notifyId, writeId] of profile) {
+      try {
+        const service = await server.getPrimaryService(normalUuid(serviceId));
+        const notify = await service.getCharacteristic(notifyId);
+        const write = await service.getCharacteristic(writeId);
+        this.notify = notify;
+        this.write = write;
+        break;
+      } catch (error) {
+        if (error.name !== 'NotFoundError') throw error;
+      }
+    }
+    if (!this.notify) throw new Error('Kein unterstützter Tuya-GATT-Dienst gefunden.');
+    this.notify.addEventListener('characteristicvaluechanged', this.listener);
+    await this.notify.startNotifications();
+    const info = await this.request(0);
+    if (info.length < 14 || ![3,4].includes(info[2])) throw new Error('Dieses Tuya-BLE-Protokoll wird nicht unterstützt.');
+    this.version = info[2];
+    if (!info[5]) throw new Error('Gerät meldet sich als ungebunden. Diese Seite setzt ein bereits gebundenes Gerät voraus.');
+    this.session = await importKey(md5(concat(this.material, info.subarray(6,12))));
+    const auth = new Uint8Array(44);
+    auth.set(concat(uuid, local.subarray(0,6), id));
+    try {
+      const response = await this.request(1, auth);
+      if (response.length !== 1 || ![0,2].includes(response[0])) throw new Error('Das Gerät hat die Zugangsdaten abgelehnt.');
+    } finally {
+      auth.fill(0);
+    }
+  }
+  dispose() {
+    this.closed = true;
+    this.notify?.removeEventListener('characteristicvaluechanged', this.listener);
+    for (const pending of this.pending.values()) pending.reject(new Error('Bluetooth-Verbindung getrennt.'));
+    this.pending.clear();
+    this.statusQuery?.reject(new Error('Bluetooth-Verbindung getrennt.'));
+  }
+  send(seq, reply, code, payload) {
+    const operation = this.writes.then(async () => {
+      if (this.closed) throw new Error('Bluetooth-Verbindung getrennt.');
+      const key = code === 0 ? this.login : this.session;
+      const flag = code === 0 ? this.loginFlag : this.loginFlag + 1;
+      const frame = await packFrame(key, flag, seq, reply, code, payload);
+      for (const fragment of fragments(frame, this.version)) {
+        if (this.write.properties.writeWithoutResponse) await this.write.writeValueWithoutResponse(fragment);
+        else await this.write.writeValueWithResponse(fragment);
+      }
+    });
+    this.writes = operation.catch(() => {});
+    return operation;
+  }
+  async request(code, payload = bytes()) {
+    const seq = this.nextSequence++;
+    let timer;
+    const response = new Promise((resolve,reject) => {
+      this.pending.set(seq,{code,resolve,reject});
+      timer = setTimeout(() => reject(new Error('Keine Tuya-Antwort auf 0x' + code.toString(16) + '.')), 12000);
+    });
+    try {
+      const [, data] = await Promise.all([this.send(seq,0,code,payload),response]);
+      return data;
+    } finally {
+      clearTimeout(timer);
+      this.pending.delete(seq);
+    }
+  }
+  async queryStatus() {
+    const seq = this.nextSequence++;
+    let timer;
+    const reports = new Promise((resolve,reject) => {
+      this.statusQuery = {seq,resolve,reject};
+      timer = setTimeout(() => reject(new Error('Keine Statusdaten vom Ventil empfangen.')),12000);
+    });
+    try {
+      await Promise.all([this.send(seq,0,3,bytes()),reports]);
+    } finally {
+      clearTimeout(timer);
+      this.statusQuery = null;
+    }
+  }
+  async receive(fragment) {
+    let [index, offset] = readVarint(fragment,0);
+    if (index === 0) {
+      let size;
+      [size, offset] = readVarint(fragment,offset);
+      if (size < 33 || size > 4096 || offset >= fragment.length) throw new Error('Ungültige Tuya-Paketlänge.');
+      this.input = {size, index:0, length:0, parts:[]};
+      offset++;
+    }
+    const input = this.input;
+    if (!input || index !== input.index) {
+      this.input = null;
+      return;
+    }
+    const part = fragment.subarray(offset);
+    input.parts.push(part);
+    input.index++;
+    input.length += part.length;
+    if (input.length < input.size) return;
+    this.input = null;
+    if (input.length !== input.size) throw new Error('Tuya-Paketlänge stimmt nicht.');
+    const frame = concat(...input.parts);
+    const key = frame[0] === this.loginFlag ? this.login : frame[0] === this.loginFlag + 1 ? this.session : null;
+    if (!key) return;
+    const {seq,reply,code,payload} = await unpackFrame(key,frame);
+    const pending = this.pending.get(reply);
+    if (pending?.code === code) {
+      pending.resolve(payload);
+      return;
+    }
+    const query = this.statusQuery;
+    if (query && reply === query.seq && code === 3) {
+      if (payload.length !== 1 || payload[0] !== 0) query.reject(new Error('Statusabfrage abgelehnt.'));
+      return;
+    }
+    if (!reply && this.session) await this.report(seq,code,payload);
+  }
+  async report(seq, code, payload) {
+    let reply = bytes();
+    let offset = 0;
+    const timestampEnd = start => {
+      if (payload[start] === 0) return start + 14;
+      if (payload[start] === 1) return start + 5;
+      throw new Error('Ungültiger Tuya-Zeitstempel.');
+    };
+    if (code === 0x8011 || code === 0x8012) {
+      const now = new Date();
+      const timezone = word(-now.getTimezoneOffset() * 10 / 60);
+      const time = code === 0x8011 ? encoder.encode(String(now.getTime())) :
+        bytes(now.getFullYear() % 100, now.getMonth()+1, now.getDate(), now.getHours(), now.getMinutes(), now.getSeconds(), (now.getDay()+6)%7);
+      await this.send(this.nextSequence++,seq,code,concat(time,timezone));
+      return;
+    }
+    if (![0x8001,0x8003,0x8004,0x8005,0x8006,0x8007].includes(code)) return;
+    const wide = code >= 0x8006;
+    if (wide) {
+      if (payload.length < 7 || payload[0] !== 0) throw new Error('Ungültiger Tuya-Status.');
+      offset = code === 0x8007 ? timestampEnd(7) : 7;
+      reply = concat(payload.subarray(0,7), bytes(0));
+    } else if (code === 0x8004 || code === 0x8005) {
+      if (payload.length < 3) throw new Error('Ungültiger Tuya-Status.');
+      offset = code === 0x8005 ? timestampEnd(3) : 2;
+      reply = concat(payload.subarray(0,3), bytes(0));
+    } else if (code === 0x8003) {
+      offset = timestampEnd(0);
+    }
+    const values = new Map();
+    while (offset < payload.length) {
+      const size = wide ? 4 : 3;
+      if (offset + size > payload.length) throw new Error('Unvollständiger Datenpunkt.');
+      const id = payload[offset];
+      const type = payload[offset+1];
+      const length = wide ? view(payload).getUint16(offset+2) : payload[offset+2];
+      const start = offset + size;
+      offset = start + length;
+      if (offset > payload.length) throw new Error('Ungültige Datenpunktlänge.');
+      if (type === 1 && length === 1) values.set(id, Boolean(payload[start]));
+      if (type === 2 && length === 4) values.set(id, view(payload).getInt32(start));
+    }
+    this.onReport(values);
+    if ([1,7,11].some(id => values.has(id))) this.statusQuery?.resolve();
+    if (!wide || !(payload[5] & 128)) await this.send(this.nextSequence++,seq,code,reply);
+  }
+  async valve(on, seconds) {
+    const field = (id,type,value) => concat(bytes(id,type),this.version === 3 ? bytes(value.length) : word(value.length),value);
+    let payload = field(1,1,bytes(Number(on)));
+    if (on) payload = concat(payload,field(11,2,integer(seconds)));
+    const result = this.version === 3 ? await this.request(2,payload) :
+      await this.request(0x27,concat(bytes(0),integer(this.nextSequence++),payload));
+    const status = this.version === 3 ? (result.length === 1 ? result[0] : 0) : result[5];
+    if (status !== 0) throw new Error('Gerät meldet Fehler beim Ventilbefehl.');
+  }
+}
+
+const get = id => document.getElementById(id);
+const setStatus = message => {get('status').textContent = message;};
+const supported = Boolean(navigator.bluetooth && globalThis.crypto?.subtle && isSecureContext);
+let connection;
+let ready = false;
+let busy = false;
+let valveState;
+let battery;
+const lines = [];
+function log(message) {
+  lines.push(new Date().toLocaleTimeString('de-DE') + '  ' + message);
+  if (lines.length > 120) lines.shift();
+  get('log').textContent = lines.join('\n');
+}
+function controls() {
+  get('connect').disabled = !supported || busy || Boolean(connection);
+  get('inspect').disabled = !supported || busy || Boolean(connection);
+  get('save-setup').disabled = busy || !setupCandidate;
+  get('provision').disabled = busy || Boolean(connection) || !setupCandidate?.saved || setupCandidate.attempted;
+  get('disconnect').disabled = busy || !connection;
+  for (const name of ['start','stop','refresh']) get(name).disabled = !ready || busy;
+}
+function report(values) {
+  if (values.has(1)) valveState = values.get(1);
+  if (values.has(7)) battery = values.get(7);
+  get('valve').textContent = 'Ventil ' + (valveState === undefined ? 'unbekannt' : valveState ? 'offen' : 'geschlossen') +
+    ' · Batterie ' + (battery === undefined ? 'unbekannt' : battery + ' %');
+  const visible = [1,7,11].filter(id => values.has(id));
+  if (visible.length) log('Vom Gerät · ' + visible.map(id => 'DP ' + id + ' = ' + values.get(id)).join(', '));
+}
+function disconnect(current) {
+  if (connection !== current) return;
+  connection = undefined;
+  ready = false;
+  current.dispose();
+  current.device.removeEventListener('gattserverdisconnected',disconnectListener);
+  current.device.gatt.disconnect();
+  valveState = battery = undefined;
+  report(new Map());
+  setStatus('Getrennt');
+  controls();
+}
+function readCredentials() {
+  const id = ascii(get('device-id').value.trim());
+  const uuid = ascii(get('uuid').value.trim());
+  const value = get('local-key').value;
+  const sec = get('sec-key').value;
+  if (value.startsWith('hex:') && (!/^hex:[0-9a-f]{12}$/i.test(value) || sec)) throw new Error('Erwartet werden sechs Hex-Schlüsselbytes ohne SecKey.');
+  const local = value.startsWith('hex:') ? fromHex(value.slice(4)) : ascii(value);
+  const secure = sec ? ascii(sec) : null;
+  if (uuid.length + 6 + id.length > 44) throw new Error('Geräte-ID und UUID sind zusammen zu lang.');
+  return {id,uuid,local,secure};
+}
+async function loginTo(device,credentials) {
+  const current = new TuyaConnection(device,credentials,report,error => log(error.message));
+  connection = current;
+  disconnectListener = () => disconnect(current);
+  device.addEventListener('gattserverdisconnected',disconnectListener);
+  setStatus('Tuya-Anmeldung läuft …');
+  await current.connect();
+  if (connection !== current) throw new Error('Bluetooth-Verbindung getrennt.');
+  ready = true;
+  setStatus('Angemeldet · ' + (device.name || 'Tuya BLE') + ' · Protokoll ' + current.version);
+  log('Tuya-Anmeldung bestätigt.');
+}
+get('connect-form').onsubmit = async event => {
+  event.preventDefault();
+  if (!supported || busy || connection) return;
+  busy = true;
+  controls();
+  try {
+    const credentials = readCredentials();
+    const device = await navigator.bluetooth.requestDevice({
+      acceptAllDevices:true, optionalServices:profile.map(([id]) => normalUuid(id))
+    });
+    await loginTo(device,credentials);
+  } catch (error) {
+    if (connection) disconnect(connection);
+    setStatus(error.message);
+    log(error.message);
+  } finally {
+    busy = false;
+    controls();
+  }
+};
+get('disconnect').onclick = () => disconnect(connection);
+async function run(message, action, success = 'Tuya-Antwort empfangen.') {
+  if (!ready || busy) return;
+  busy = true;
+  controls();
+  log(message);
+  try {
+    await action(connection);
+    log(success);
+  } catch (error) {
+    log(error.message);
+  } finally {
+    busy = false;
+    controls();
+  }
+}
+get('water-form').onsubmit = event => {
+  event.preventDefault();
+  const seconds = Number(get('duration').value);
+  if (Number.isInteger(seconds) && seconds >= 1 && seconds <= 35940) {
+    run('Start · DP 1 = true, DP 11 = ' + seconds, device => device.valve(true,seconds));
+  }
+};
+get('stop').onclick = () => run('Stopp · DP 1 = false', device => device.valve(false));
+get('refresh').onclick = () => run('Status abfragen', device => device.queryStatus(), 'Statusdaten empfangen.');
+const setupProduct = '16wgjvck';
+const setupService = normalUuid('a201');
+const setupGattService = normalUuid('1910');
+let setupCandidate;
+let disconnectListener;
+const hex = data => Array.from(data, byte => byte.toString(16).padStart(2,'0')).join('');
+const fromHex = data => Uint8Array.from(data.match(/../g), byte => parseInt(byte,16));
+const delay = ms => new Promise(resolve => setTimeout(resolve,ms));
+function setupStatus(message) {
+  get('setup-status').textContent = message;
+}
+
+async function inspectAdvertisement(device) {
+  if (!device.watchAdvertisements) {
+    throw new Error('BLE-Werbedaten sind in diesem Chrome nicht verfügbar. Siehe Hinweis oberhalb.');
+  }
+  const controller = new AbortController();
+  let timer;
+  let listener;
+  let count = 0;
+  let manufacturer;
+  let service;
+  const summary = () => {
+    const length = value => value ? value.byteLength + ' Byte' : 'fehlt';
+    return count + ' BLE-Ereignisse · Hersteller 0x07D0: ' + length(manufacturer) +
+      ' · Service-Daten 0xA201: ' + length(service);
+  };
+  try {
+    return await new Promise((resolve,reject) => {
+      timer = setTimeout(() => reject(new Error('BLE-Prüfung nach 20 Sekunden beendet. ' + summary() + '.')), 20000);
+      listener = event => {
+        count++;
+        manufacturer = event.manufacturerData.get(2000) ?? manufacturer;
+        service = event.serviceData.get(setupService) ?? service;
+        if (manufacturer && service) {
+          log(summary());
+          resolve({manufacturer,service});
+        }
+      };
+      device.addEventListener('advertisementreceived',listener);
+      device.watchAdvertisements({signal:controller.signal}).catch(reject);
+    });
+  } finally {
+    clearTimeout(timer);
+    device.removeEventListener('advertisementreceived',listener);
+    controller.abort();
+  }
+}
+async function decodeLocalIdentity({manufacturer,service}) {
+  const product = new Uint8Array(service.buffer,service.byteOffset,service.byteLength);
+  const meta = new Uint8Array(manufacturer.buffer,manufacturer.byteOffset,manufacturer.byteLength);
+  const productField = product.subarray(1);
+  const productLength = setupProduct.length;
+  const pid = productField.subarray(0,productLength);
+  const padded = productField.length === 16 && productField.subarray(productLength).every(byte => byte === 0);
+  if (meta.length !== 22 || product[0] !== 0 || meta[1] !== 3 ||
+      new TextDecoder().decode(pid) !== setupProduct || (productField.length !== productLength && !padded)) {
+    throw new Error('Werbedaten passen nicht zum lokalen Profil (ALDI 16wgjvck, Tuya BLE 3).');
+  }
+  const identities = new Set();
+  for (const field of padded ? [pid,productField] : [pid]) {
+    const fingerprint = md5(field);
+    const key = await importKey(fingerprint);
+    const raw = await decryptBlocks(key,fingerprint,meta.subarray(6));
+    if (raw.length === 16 && raw.every(byte => byte >= 32 && byte < 127)) {
+      identities.add(new TextDecoder().decode(raw));
+    }
+  }
+  if (identities.size !== 1) throw new Error('Geräte-UUID konnte nicht eindeutig validiert werden.');
+  return {uuid:[...identities][0], bound:Boolean(meta[0] & 128)};
+}
+function downloadSetup({uuid,id,key}) {
+  const file = new Blob([JSON.stringify({uuid,id,key},null,2)],{type:'application/json'});
+  const url = URL.createObjectURL(file);
+  const link = document.createElement('a');
+  link.href = url;
+  link.download = 'aldi-garden-zugangsdaten.json';
+  link.click();
+  setTimeout(() => URL.revokeObjectURL(url),1000);
+}
+function useCredentials({uuid,id,key}) {
+  get('uuid').value = uuid;
+  get('device-id').value = id;
+  get('local-key').value = key;
+  get('sec-key').value = '';
+}
+function plainSetupFrame(sequence,code,payload) {
+  const body = frameBody(sequence,0,code,payload);
+  return fragments(concat(bytes(0),body),3);
+}
+async function provision({device,uuid,id,key}) {
+  const server = await device.gatt.connect();
+  try {
+    let service;
+    try {
+      service = await server.getPrimaryService(setupGattService);
+    } catch (error) {
+      if (error.name !== 'NotFoundError') throw error;
+      service = await server.getPrimaryService(setupService);
+    }
+    const write = await service.getCharacteristic(normalUuid('2b11'));
+    const notify = await service.getCharacteristic(normalUuid('2b10'));
+    await notify.startNotifications();
+    log('Kopplung über GATT ' + (service.uuid || setupGattService));
+    const send = async (sequence,code,payload) => {
+      for (const packet of plainSetupFrame(sequence,code,payload)) {
+        await write.writeValueWithoutResponse(packet);
+        await delay(50);
+      }
+    };
+    await send(1,0,bytes());
+    await delay(1000);
+    await send(2,1,concat(ascii(uuid),fromHex(key.slice(4)),ascii(id)));
+    await delay(2000);
+  } finally {
+    device.gatt.disconnect();
+  }
+  await delay(1000);
+}
+
+get('inspect').onclick = async () => {
+  if (busy || connection) return;
+  busy = true;
+  setupCandidate = null;
+  controls();
+  try {
+    const device = await navigator.bluetooth.requestDevice({
+      acceptAllDevices:true, optionalServices:profile.map(([id]) => normalUuid(id)),
+      optionalManufacturerData:[2000]
+    });
+    setupStatus('Warte auf BLE-Werbedaten …');
+    const {uuid,bound} = await decodeLocalIdentity(await inspectAdvertisement(device));
+    if (bound) {
+      setupStatus('ALDI-Profil erkannt. Das Gerät meldet bereits eine Bindung.');
+      return;
+    }
+    setupCandidate = {device,uuid,id:hex(crypto.getRandomValues(new Uint8Array(11))),
+      key:'hex:' + hex(crypto.getRandomValues(new Uint8Array(6))),saved:false,attempted:false};
+    setupStatus('Ungebundenes ALDI-Gerät mit Protokoll 3 erkannt. Speichere vor der Kopplung die Zugangsdaten.');
+  } catch (error) {
+    setupStatus(error.message);
+  } finally {
+    busy = false;
+    controls();
+  }
+};
+get('save-setup').onclick = () => {
+  if (!setupCandidate) return;
+  downloadSetup(setupCandidate);
+  setupCandidate.saved = true;
+  controls();
+};
+get('provision').onclick = async () => {
+  const candidate = setupCandidate;
+  if (!candidate?.saved || candidate.attempted || busy || connection) return;
+  if (!confirm('Sind die Zugangsdaten gespeichert? Das Ventil wird jetzt lokal gebunden.')) return;
+  busy = true;
+  controls();
+  try {
+    const current = await decodeLocalIdentity(await inspectAdvertisement(candidate.device));
+    if (current.bound || current.uuid !== candidate.uuid) throw new Error('Der Bindungszustand oder die UUID hat sich geändert.');
+    useCredentials(candidate);
+    candidate.attempted = true;
+    setupStatus('Lokale Erstkopplung läuft …');
+    await provision(candidate);
+    await loginTo(candidate.device, readCredentials());
+    setupStatus('Lokale Kopplung durch erneute Tuya-Anmeldung bestätigt.');
+  } catch (error) {
+    if (connection) disconnect(connection);
+    setupStatus(error.message + (candidate.attempted ? ' Zugangsdaten behalten und über „Bluetooth-Gerät wählen“ prüfen, ob das Ventil die Bindung übernommen hat.' : ''));
+  } finally {
+    busy = false;
+    controls();
+  }
+};
+
+if (!supported) setStatus('Web Bluetooth fehlt in dieser Ansicht. In Chrome oder Edge am PC öffnen. Falls nötig über localhost oder HTTPS laden.');
+controls();
+</script>
+</html>

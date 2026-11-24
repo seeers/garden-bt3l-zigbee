@@ -1,0 +1,175 @@
+<!doctype html>
+<html lang="de">
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>FT61E0A5 · UART-Test</title>
+<style>
+:root{color-scheme:dark;font:16px system-ui;background:#101c20;color:#eaf4f2}
+body{max-width:720px;margin:auto;padding:28px 16px}section{padding:18px;margin:14px 0;background:#192c31;border:1px solid #38565b;border-radius:10px}
+h1,h2{margin:0 0 10px}h2{font-size:1.15rem}p,li{line-height:1.5}
+button{font:inherit;border-radius:6px;border:1px solid #65908e;background:#254149;color:inherit;padding:8px 12px;margin:4px 3px 4px 0;cursor:pointer}
+button:disabled{opacity:.4;cursor:default}pre{min-height:4em;max-height:18em;overflow:auto;white-space:pre-wrap;overflow-wrap:anywhere}small{color:#c7d9d8}
+</style>
+<h1>FT61E0A5 · UART-Test</h1>
+<p>FTDI mit 3,3-V-Logik · 9600 Baud, 8N1</p>
+<section>
+<h2>Anschluss vor dem Senden</h2>
+<ul>
+<li>FTDI-TX erst anschließen, wenn BT3L-Pin 16 freigeschaltet oder vom MCU-Eingang getrennt ist.</li>
+<li>FTDI-TX an die Leitung zum MCU-Eingang. FTDI-RX an BT3L-Pin 15, GND an Platinenmasse. FTDI-VCC bleibt frei.</li>
+<li>Wenn du den BT3L mit RST auf Low hochohmig hältst, zuerst FTDI-TX abziehen, bevor du Reset freigibst.</li>
+</ul>
+<label><input id="confirmed" type="checkbox"> Ich habe geprüft, dass nur der FTDI den MCU-Eingang treibt.</label>
+<p id="notice" role="status"></p>
+<button id="connect" disabled>Port öffnen</button>
+<button id="disconnect" disabled>Port schließen</button>
+</section>
+<section>
+<h2>Ventil testen</h2>
+<p><small>Wasserzulauf abtrennen. „Start 10 s“ übergibt die Laufzeit an den MCU. „Stopp“ beendet den Lauf vorzeitig.</small></p>
+<button id="status" disabled>Status abfragen</button>
+<button id="start" disabled>Start 10 s</button>
+<button id="stop" disabled>Stopp</button>
+</section>
+<section><h2>UART-Protokoll</h2><pre id="log" tabindex="0"></pre></section>
+<script>
+'use strict';
+const get = id => document.getElementById(id);
+const parse = hex => Uint8Array.from(hex.split(' '), byte => parseInt(byte,16));
+const frames = {
+  status: parse('55 AA 00 08 00 00 07'),
+  start: parse('55 AA 00 06 00 0D 01 01 00 01 01 0B 02 00 04 00 00 00 0A 31'),
+  stop: parse('55 AA 00 06 00 05 01 01 00 01 00 0D'),
+  ack: parse('55 AA 00 07 00 01 00 07')
+};
+const supported = isSecureContext && 'serial' in navigator;
+const history = [];
+let port;
+let reader;
+let receiveTask;
+let writes = Promise.resolve();
+let busy = false;
+let closing = false;
+function log(direction, data) {
+  const value = typeof data === 'string' ? data :
+    Array.from(data, byte => byte.toString(16).padStart(2,'0').toUpperCase()).join(' ');
+  history.push(new Date().toLocaleTimeString('de-DE') + ' ' + direction + ' ' + value);
+  if (history.length > 300) history.shift();
+  get('log').textContent = history.join('\n');
+  get('log').scrollTop = get('log').scrollHeight;
+}
+function controls() {
+  get('confirmed').disabled = busy || Boolean(port);
+  get('connect').disabled = !supported || !get('confirmed').checked || busy || Boolean(port);
+  get('disconnect').disabled = busy || !port;
+  for (const id of ['status','start','stop']) get(id).disabled = busy || !port;
+}
+function send(current, frame) {
+  const job = writes.then(async () => {
+    if (port !== current || closing || !current.writable) return;
+    const writer = current.writable.getWriter();
+    try {
+      await writer.write(frame);
+      log('TX',frame);
+    } finally {
+      writer.releaseLock();
+    }
+  });
+  writes = job.catch(error => log('Fehler',error.message));
+}
+function extract(buffer) {
+  const start = buffer.findIndex((byte,index) => byte === 85 && buffer[index + 1] === 170);
+  if (start < 0) {
+    buffer.splice(0,buffer.length - Number(buffer.at(-1) === 85));
+    return;
+  }
+  buffer.splice(0,start);
+  if (buffer.length < 6) return;
+  const size = buffer[4] * 256 + buffer[5];
+  if (size > 1024) {
+    buffer.shift();
+    return [];
+  }
+  if (buffer.length < size + 7) return;
+  const frame = buffer.slice(0,size + 7);
+  const checksum = frame.slice(0,-1).reduce((sum,byte) => (sum + byte) & 255,0);
+  if (checksum !== frame.at(-1)) {
+    buffer.shift();
+    return [];
+  }
+  return buffer.splice(0,size + 7);
+}
+async function receive(current) {
+  const buffer = [];
+  let stream;
+  while (!closing && current.readable && stream !== current.readable) {
+    stream = current.readable;
+    reader = stream.getReader();
+    try {
+      while (!closing) {
+        const {done,value} = await reader.read();
+        if (done) return;
+        for (const byte of value) buffer.push(byte);
+        for (let frame; (frame = extract(buffer)) !== undefined;) {
+          if (!frame.length) continue;
+          log('RX',frame);
+          if (frame[3] === 7 && frame.length >= 11) send(current,frames.ack);
+        }
+      }
+    } catch (error) {
+      if (!closing) log('Lesefehler',error.message);
+      buffer.length = 0;
+    } finally {
+      reader.releaseLock();
+      reader = undefined;
+    }
+  }
+}
+async function closePort(current) {
+  if (closing || port !== current) return;
+  closing = busy = true;
+  controls();
+  try {
+    await reader?.cancel().catch(() => {});
+    await receiveTask;
+    await writes;
+    await current.close();
+  } catch (error) {
+    log('Fehler',error.message);
+  } finally {
+    port = undefined;
+    closing = busy = false;
+    get('notice').textContent = 'Port geschlossen. Vor Freigabe von RST FTDI-TX abziehen.';
+    controls();
+  }
+}
+get('confirmed').onchange = controls;
+get('connect').onclick = async () => {
+  if (busy || port || !get('confirmed').checked) return;
+  busy = true;
+  controls();
+  try {
+    const current = await navigator.serial.requestPort();
+    await current.open({baudRate:9600,dataBits:8,stopBits:1,parity:'none',flowControl:'none'});
+    port = current;
+    get('notice').textContent = 'Port offen · 9600 Baud, 8N1.';
+    receiveTask = receive(current);
+    receiveTask.then(() => closePort(current), error => {
+      log('Fehler',error.message);
+      closePort(current);
+    });
+  } catch (error) {
+    get('notice').textContent = error.name === 'NotFoundError' ? 'Portauswahl abgebrochen.' : error.message;
+  } finally {
+    busy = false;
+    controls();
+  }
+};
+get('disconnect').onclick = () => closePort(port);
+for (const id of ['status','start','stop']) get(id).onclick = () => {
+  if (port && !busy) send(port,frames[id]);
+};
+if (!supported) get('notice').textContent = 'In Chrome oder Edge am PC öffnen. Falls nötig, die Seite über localhost oder HTTPS laden.';
+controls();
+</script>
+</html>
