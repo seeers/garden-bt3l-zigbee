@@ -1,0 +1,8 @@
+/build-valve/
+/out-valve/
+/ZigbeeTLc/
+__pycache__/
+aldi-garden-zugangsdaten.json
+BT3L-original*.bin
+*.apk
+*.xapk
