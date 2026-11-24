@@ -25,7 +25,7 @@ The same board during bench testing, with temporary leads soldered to the module
 
 ## SWire programming
 
-A Blue Pill (STM32F103) running a compatible SWire programmer worked on the tested unit. Use a 3.3 V-compatible programmer with common ground and connect its SWire line to pin 11. Follow the programmer's documentation for its reset and supply connections. Supply the board through one source at a time. Pin 8 is the module's 3.3 V rail. The SWire programmer's bridge firmware and host utility are separate from this project.
+We successfully wrote the Zigbee firmware to the BT3L over SWire using [MostEmpire's Telink Open Source Debugger](https://github.com/MostEmpire/telink-opensource-debugger) with a Blue Pill (STM32F103). Use a 3.3 V-compatible programmer with common ground and connect its SWire line to pin 11. Follow the programmer's documentation for its reset and supply connections. Supply the board through one source at a time. Pin 8 is the module's 3.3 V rail. The SWire programmer's bridge firmware and host utility are separate from this project.
 
 ## Power measurement
 
