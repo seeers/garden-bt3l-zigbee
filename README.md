@@ -2,6 +2,8 @@
 
 Unofficial replacement firmware for the GARDENLINE Bluetooth watering timer sold by ALDI. It replaces the Bluetooth firmware on the BT3L module with a Zigbee end device. The FT61E0A5 on the main board continues to operate the valve, handle the button, and stop watering when the timer expires.
 
+<img src="docs/images/gardenline-watering-timer.jpg" alt="Front of the GARDENLINE Bluetooth watering timer with its green button and three status indicators" width="280">
+
 | Hardware and software | Tested configuration |
 | --- | --- |
 | Radio module | BT3L with Telink TLSR8250F512ET32 |

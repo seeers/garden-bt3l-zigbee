@@ -13,6 +13,16 @@ The table is a **top view looking at the module on the component side of the boa
 | 15 | PB7, UART RX | 2 | PC4 |
 | 16 | PB1, UART TX | 1 | RST |
 
+## Board photos
+
+The main board with the BT3L radio module at lower left and the FT61E0A5 valve controller to its right. The BT3L antenna points down, matching the orientation of the pin table.
+
+<img src="images/gardenline-pcb.jpg" alt="GARDENLINE circuit board with BT3L module and FT61E0A5 valve controller" width="560">
+
+The same board during bench testing, with temporary leads soldered to the module. Use the pin table above to identify connections.
+
+<img src="images/gardenline-pcb-wired.jpg" alt="Opened GARDENLINE timer with temporary test leads attached to the BT3L module" width="520">
+
 ## SWire programming
 
 A Blue Pill (STM32F103) running a compatible SWire programmer worked on the tested unit. Use a 3.3 V-compatible programmer with common ground and connect its SWire line to pin 11. Follow the programmer's documentation for its reset and supply connections. Supply the board through one source at a time. Pin 8 is the module's 3.3 V rail. The SWire programmer's bridge firmware and host utility are separate from this project.
