@@ -16,18 +16,18 @@ Check the module and controller markings before flashing. GARDENLINE branding al
 
 ## Features and test status
 
-- Zigbee on/off control and battery reporting. A plain **ON** starts a 60-second run.
+- Zigbee on/off control and battery reporting. In v0.4, a plain Zigbee **ON** or a Zigbee toggle from off to on starts a 60-minute run.
 - The Zigbee2MQTT converter accepts timed runs from **1 to 21,600 seconds**. This range was tested in the firmware and converter. The valve controller's actual behavior at the six-hour limit still needs a hardware test.
 - The firmware reports valve state after the valve controller confirms it. The physical button continues to control the valve locally.
 - v0.3 adds suspend and a three-second Zigbee poll interval. The firmware enables suspend after it has validated a wake signal from the valve controller against a UART frame. A Zigbee command can take a few seconds to arrive. The original unit measured about **250 µA** at idle. Current draw and wake behavior with v0.3 still need a hardware measurement.
 
-The first Zigbee build was tested on the valve. The v0.3 cross-build and host-side logic have been checked. Test the flashed device with the water supply disconnected before using it for irrigation.
+The first Zigbee build was tested on the valve. The v0.4 cross-build and host-side command tests passed. The one-hour timeout still needs a hardware test. Test the flashed device with the water supply disconnected before using it for irrigation.
 
 ## Back up, flash, and pair
 
 1. Disconnect the water supply. Identify the SWire pads from the [hardware guide](docs/hardware.md).
 2. Read the entire **512 KiB** flash from address `0x000000` and keep the dump from your own unit. Check that two independent reads match byte for byte and that the Telink image has the `KNLT` marker at offset `0x08`. A file of the expected size can still contain read errors.
-3. Download [BT3L-Zigbee-v0.3.bin](firmware/BT3L-Zigbee-v0.3.bin) and check its [SHA-256 checksum](firmware/SHA256SUMS). Program the raw image at `0x000000` with sector erase limited to the image and verify the result. A whole-chip erase would also remove the original device data, including the sectors at `0x76000` and `0x77000`.
+3. Download [BT3L-Zigbee-v0.4.bin](firmware/BT3L-Zigbee-v0.4.bin) and check its [SHA-256 checksum](firmware/SHA256SUMS). Program the raw image at `0x000000` with sector erase limited to the image and verify the result. A whole-chip erase would also remove the original device data, including the sectors at `0x76000` and `0x77000`.
 4. Disconnect the programmer and power-cycle the device. On a fresh installation, enable joining in Zigbee2MQTT and hold the valve's physical button to request pairing. On an update, use the existing pairing if it is still present.
 5. Test start, stop, the automatic timeout, and the physical button. To restore Bluetooth, program and verify your own full original flash dump at `0x000000`.
 
@@ -39,7 +39,7 @@ Publish with **retain off** to `zigbee2mqtt/<friendly_name>/set`.
 
 | MQTT payload | Action |
 | --- | --- |
-| `{"state":"ON"}` | Start a 60-second run |
+| `{"state":"ON"}` | Start a 60-minute run |
 | `{"water_for":600}` | Start a ten-minute run |
 | `{"state":"ON","on_time":600,"off_wait_time":0}` | Start a ten-minute run using the timed on syntax |
 | `{"state":"OFF"}` | Stop watering |

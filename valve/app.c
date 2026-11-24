@@ -7,7 +7,7 @@
 #include "tuya_uart.h"
 
 #define EP 1
-#define DEFAULT_RUN_SECONDS 60
+#define DEFAULT_RUN_SECONDS (60u * 60u)
 #define MAX_RUN_SECONDS (6u * 60u * 60u)
 #define GARDEN_CONTROL_CLUSTER 0xfc90
 #define GARDEN_START_TIMED 0x00
@@ -58,7 +58,7 @@ static u32 rejoin_tick;
 static u8 rejoin_pending;
 
 static u8 zcl_version = 3;
-static u8 app_version = 3;
+static u8 app_version = 4;
 static u8 power_source = 3;
 static u8 manufacturer[] = {4, 'A', 'L', 'D', 'I'};
 static u8 model[] = {13, 'G','A','R','D','E','N','-','B','T','3','L','-','Z'};
