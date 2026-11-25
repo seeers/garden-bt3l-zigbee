@@ -43,6 +43,15 @@ static u32 module_wake_tick;
 static drv_pm_pinCfg_t wake_pin = {MODULE_WAKE_PIN, PM_WAKEUP_LEVEL_HIGH};
 static tuya_parser_t parser;
 
+// Values from command 0x03 in the original BT3L firmware.
+enum {
+    TUYA_UNBOUND = 0x00,
+    TUYA_BOUND_OFFLINE = 0x01,
+    TUYA_CONNECTED = 0x02,
+};
+
+static u8 connection_state = TUYA_UNBOUND;
+static u8 queued_connection_state = 0xff;
 static u8 valve_on;
 static u8 valve_known;
 static u8 battery = 0xff;
@@ -58,7 +67,7 @@ static u32 rejoin_tick;
 static u8 rejoin_pending;
 
 static u8 zcl_version = 3;
-static u8 app_version = 4;
+static u8 app_version = 6;
 static u8 power_source = 3;
 static u8 manufacturer[] = {4, 'A', 'L', 'D', 'I'};
 static u8 model[] = {13, 'G','A','R','D','E','N','-','B','T','3','L','-','Z'};
@@ -226,7 +235,7 @@ static void receive_frame(u8 command, const u8 *payload, u16 length)
         break;
     case TUYA_JOIN_BUTTON:
         if (length == 1 && payload[0] == 0) {
-            if (send_frame(command, &ok, 1) && !own_network) {
+            if (send_frame(command, &ok, 1)) {
                 join_requested = 1;
             }
         }
@@ -351,8 +360,10 @@ static void bdb_initialized(u8 status, u8 joined)
     if (joined) {
         own_network = 1;
         if (status == BDB_INIT_STATUS_SUCCESS) {
+            connection_state = TUYA_CONNECTED;
             zb_setPollRate(POLL_INTERVAL_MS);
         } else {
+            connection_state = TUYA_BOUND_OFFLINE;
             rejoin_tick = clock_time();
             rejoin_pending = 1;
         }
@@ -363,12 +374,14 @@ static void bdb_commissioned(u8 status, void *arg)
 {
     (void)arg;
     if (status == BDB_COMMISSION_STA_SUCCESS && zb_isDeviceJoinedNwk()) {
+        connection_state = TUYA_CONNECTED;
         own_network = 1;
         rejoin_pending = 0;
         zb_setPollRate(POLL_INTERVAL_MS);
         send_frame(TUYA_QUERY_DPS, NULL, 0);
     } else if (own_network && (status == BDB_COMMISSION_STA_PARENT_LOST ||
                               status == BDB_COMMISSION_STA_REJOIN_FAILURE)) {
+        connection_state = TUYA_BOUND_OFFLINE;
         rejoin_tick = clock_time();
         rejoin_pending = 1;
     }
@@ -380,10 +393,10 @@ static bdb_appCb_t bdb_callbacks = {
 
 static void network_left(nlme_leave_ind_t *indication)
 {
+    connection_state = indication->rejoin ? TUYA_BOUND_OFFLINE : TUYA_UNBOUND;
     if (!indication->rejoin) {
         own_network = 0;
         rejoin_pending = 0;
-        join_requested = 0;
     }
 }
 
@@ -404,17 +417,27 @@ static const u8 startup_commands[] = {
     TUYA_WORK_MODE, TUYA_CONNECTION_STATE, TUYA_QUERY_DPS,
 };
 
+static u8 send_connection_state(void)
+{
+    if (!send_frame(TUYA_CONNECTION_STATE, &connection_state, 1)) {
+        return 0;
+    }
+    queued_connection_state = connection_state;
+    return 1;
+}
+
 static void startup_poll(void)
 {
-    const u8 disconnected = 1;
     const u32 delay = startup_step == 0 ? 1200000 : startup_step == 1 ? 2000000 : 80000;
     if (startup_step < NUM(startup_commands) && clock_time_exceed(startup_tick, delay)) {
-        u8 command = startup_commands[startup_step];
-        const u8 is_state = command == TUYA_CONNECTION_STATE;
-        if (send_frame(command, is_state ? &disconnected : NULL, is_state)) {
+        const u8 command = startup_commands[startup_step];
+        if (command == TUYA_CONNECTION_STATE ? send_connection_state() : send_frame(command, NULL, 0)) {
             startup_tick = clock_time();
             ++startup_step;
         }
+    }
+    if (startup_step && connection_state != queued_connection_state) {
+        send_connection_state();
     }
     if (command_pending && clock_time_exceed(command_tick, 2500000)) {
         if (send_frame(TUYA_QUERY_DPS, NULL, 0)) {
@@ -429,6 +452,7 @@ static u8 uart_idle_for_sleep(void)
     return low_power_enabled && module_wake_verified &&
            startup_step == NUM(startup_commands) &&
            !command_pending && !join_requested &&
+           connection_state == queued_connection_state &&
            !mcu_wake_active && tx_in == tx_out &&
            rx_in == rx_out && !rx_overflow && !parser.used &&
            !gpio_read(MODULE_WAKE_PIN) && !uart_tx_is_busy() &&
@@ -453,6 +477,31 @@ static void suspend_when_idle(void)
         }
     }
     irq_restore(irq);
+}
+
+static void pairing_poll(void)
+{
+    if (join_requested) {
+        // Let the valve controller receive its acknowledgement before resetting Zigbee.
+        if (tx_in != tx_out || mcu_wake_active || uart_tx_is_busy() ||
+            tl_stackBusy() || !zb_isTaskDone()) {
+            return;
+        }
+        if (!zb_isDeviceFactoryNew()) {
+            connection_state = TUYA_UNBOUND;
+            own_network = 0;
+            rejoin_pending = 0;
+            // The SDK resets Zigbee NV state and reinitializes BDB asynchronously.
+            // Keep the request queued until BDB is idle again.
+            tl_bdbReset2FN();
+            return;
+        }
+    } else if (!rejoin_pending || !clock_time_exceed(rejoin_tick, 10000000)) {
+        return;
+    }
+    join_requested = 0;
+    rejoin_pending = 0;
+    bdb_networkSteerStart();
 }
 
 static void application_init(void)
@@ -502,12 +551,8 @@ int main(void)
         tl_zbTaskProcedure();
         startup_poll();
         if (BDB_STATE_GET() == BDB_STATE_IDLE) {
-            if (join_requested || (rejoin_pending && clock_time_exceed(rejoin_tick, 10000000))) {
-                join_requested = 0;
-                rejoin_pending = 0;
-                bdb_networkSteerStart();
-            }
-            if (zb_isDeviceJoinedNwk()) {
+            pairing_poll();
+            if (BDB_STATE_GET() == BDB_STATE_IDLE && zb_isDeviceJoinedNwk()) {
                 report_handler();
             }
         }

@@ -29,6 +29,8 @@ We successfully wrote the Zigbee firmware to the BT3L over SWire using [MostEmpi
 
 ## Power measurement
 
-With the water supply disconnected, unplug the programmer and UART adapters, then power-cycle the paired timer. Open and close the valve with the physical button once so v0.3 can observe a UART frame preceded by a valid wake signal. Check that Zigbee reports both state changes and then test a remote start and stop.
+See the [v0.6 PPK2 idle trace](power-measurement.md).
 
-Measure the average current of the **whole unit** with the valve closed over at least 30 seconds. The Zigbee radio wakes periodically to poll. If v0.3 stays awake, check **PB5 (pin 14)**. It should idle low and go high before the FT61E0A5 transmits a UART message. **PD2 (pin 5)** carries the wake signal in the other direction.
+With the water supply disconnected, unplug the programmer and UART adapters, then power-cycle the paired timer. Open and close the valve with the physical button once so the firmware can observe a UART frame preceded by a valid wake signal. Check that Zigbee reports both state changes and then test a remote start and stop.
+
+Measure the average current of the **whole unit** with the valve closed over at least 30 seconds. The Zigbee radio wakes periodically to poll. If the module stays awake, check **PB5 (pin 14)**. It should idle low and go high before the FT61E0A5 transmits a UART message. **PD2 (pin 5)** carries the wake signal in the other direction.
